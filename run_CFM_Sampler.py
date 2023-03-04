@@ -8,12 +8,7 @@ Created on Thu Mar 21 23:19:00 2019
 import sys
 import numpy as np
 import os
-import shutil
-path_list = sys.path
-module_path_scattering = '/Users/Aqiph/Documents/Codes/Scattering_Dynamics'
-if module_path_scattering not in sys.path:
-    sys.path.append(module_path_scattering)
-    print('Add scattering module path')
+
 from CFM_Sampler import Sampler
 from trajectory_analysis import Trajectory
 
