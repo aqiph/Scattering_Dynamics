@@ -9,7 +9,7 @@ import sys
 import numpy as np
 import os
 
-from CFM_Sampler import Sampler
+from MD_preparation import Sampler
 from trajectory_analysis import Trajectory
 
 
