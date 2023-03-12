@@ -8,16 +8,13 @@ Created on Sun Feb 17 14:59:23 2019
 import os
 
 import numpy as np
-import math
-import linecache
-from scipy.stats import boltzmann
 from scipy.stats import maxwell
 from scipy import interpolate
 import random
 
 from utils.read_file import read_coordinates, read_normal_modes, read_coordinates_from_trajectory,\
     read_velocities_from_trajectory, read_energy_from_trajectory
-from utils.tools import get_COM, rotate
+from utils.tools import get_COM, rotate, gen_state_from_Boltzmann, gen_energy_from_Classical_Boltzmann
 
 
 
@@ -50,6 +47,14 @@ class Sampler():
     
     def get_atom_coordinates(self, coordinates, atomNum):
         return coordinates[atomNum - 1]
+
+
+    def get_state(self):
+        return self.atom_types, self.atom_counts, self.coordinates, self.flags, self.velocities
+
+
+    def get_title(self):
+        return self.title
 
 
 ### Setters ###
@@ -105,8 +110,8 @@ class Sampler():
         Take in an impact atom position, coordinates_impact_site, on which the molecule collides with,
         and the coordinates of the reference atom, e.g. the COM of the cluster, coordinates_ref_atom,
         generate the coordinates for molecule, and the impact direction
-        :param input_file: str, path of the input file, i.e. POSCAR
-        :param file_format: str, format of the input coordinates and velocities file. Allowed values include 'vasp' or 'ase'
+        :param input_file: str, path of the coordinates input file, i.e. POSCAR
+        :param file_format: str, format of the coordinates and velocities input file. Allowed values include 'vasp' or 'ase'
         :param coordinates_impact_site: list of floats, coordinates of the impact site
         :param coordinates_ref_atom: list of floats, coordinates of the reference atom
         :param distance_to_cluster: float, distance between the molecule's COM and the impact site
@@ -136,668 +141,470 @@ class Sampler():
         return coordinates_new, impact_vector_normed
     
     
-    def gen_velocities_vib(self, input_file_coordinates, file_format, input_file_mode, num_modes, lcell, lrotation, method, temp, state=None, randomPhase=True, anharmonicity=None):
+    def gen_velocities_vib(self, input_file_coordinates, file_format, input_file_modes, num_modes, lcell, lrotation, method_vib, temp_vib,
+                           state=None, input_phase='random', input_file_anharmonicity=None):
         """
         Generate vibrational velocity for a structure
-        :param input_file_coordinates: str, path of atomic coordinates file, i.e. POSCAR
-        :param file_format: str, format of the input coordinates and velocities file. Allowed values include 'vasp' or 'ase'
-        :param input_file_mode: str, path of normal modes file
-        :param num_modes: int, the number of modes
-        :param lcell: boolean, whether overwrite cell
-        :param lrotation: boolean, whether rotate molecule or not
-        :param method: str, method for generating vibrational velocity. 'EP' for 'Equipartition', 'EP_TS' for 'Equipartition for TS',
+        :param input_file_coordinates: str, path of the coordinates input file, i.e. POSCAR
+        :param file_format: str, format of the coordinates and velocities input file. Allowed values include 'vasp' or 'ase'
+        :param input_file_modes: str, path of the normal modes input file
+        :param num_modes: int, number of normal modes
+        :param lcell: boolean, whether to overwrite the cell or not
+        :param lrotation: boolean, whether to rotate molecule or not
+        :param method_vib: str, method for generating vibrational velocities. 'EP' for 'Equipartition', 'EP_TS' for 'Equipartition for TS',
         'QCT' for 'Quasi-classical trajectory', 'QCT_TS' for 'Quasi-classical trajectory for TS', 'CB' for 'Classical Boltzmann (Exponetial)',
         'QCT_noZPE' for 'QCT without ZPE'.
-        :param temp: float, temperature
-        :param state: list, a list of quantum numbers
-        :param randomPhase: boolean or integer, if it is a boolean, perform random phase or not; if it is an integer, randomPhase * phi is the input phase
-        :param anharmonicity: None or string, do not consider anharmonicity if None; file name indicates whether consider anharmonicity
+        :param temp_vib: float, temperature of vibrational energy
+        :param state: list, list of quantum numbers
+        :param input_phase: str or list of floats; if it is a str, allowed values include 'random' and 'equilibrium';
+        if it is a list of floats, input phases are defined by input_phase * pi
+        :param input_file_anharmonicity: None or str, if it is None, do not consider anharmonicity;
+        if it is a str, it is the path of the anharmonicity input file
         :return:
         atom_types: list of strs, element types
-        atom_counts: list of ints, the number of each element type
-        coordinates: list of lists, coordinates: [[x1, y1, z1], [x2, y2, z2], ...]
-        flags: list of strs
+        atom_counts: list of ints, number of atoms for each element type
+        coordinates: list of lists, [[x1, y1, z1], [x2, y2, z2], ...]
+        flags: list of strs, flags
         velocities_vib: list of lists, vibrational velocities, [[x1, y1, z1], [x2, y2, z2], ...]
         """
         # constant
         kb = 8.61733035e-05       #Boltzmann constant in eV/K
         
-        # Read coordinates and normal modes
+        # read coordinates and normal modes
         cell, atom_types, atom_counts, coordinates, flags, _, _ = read_coordinates(input_file_coordinates, file_format)
         if lcell:
             self.set_cell(cell)
         num_atoms = sum(atom_counts)
-        freq_list, modes = read_normal_modes(input_file_mode, num_modes, num_atoms)
-        
+        freq_list, modes = read_normal_modes(input_file_modes, num_modes, num_atoms)
         assert len(freq_list) == num_modes
         assert len(modes) == num_modes
         assert len(modes[0]) == num_atoms
         
-        # Rotate the molecule, update both coordinates and modes
+        # rotate the molecule, update both coordinates and modes
         if lrotation:
-            coordinates, modes = rotate(atom_types, atom_counts, coordinates, modes)
+            coordinates, modes = rotate(atom_types, atom_counts, coordinates, modes, lprint=False)
                              
-        # Compute energy for normal mode
+        # compute energy for each normal mode
         ### Equipartition ###
-        if method == 'EP':
-            energyList = np.array([kb * temp for i in range(num_modes)])     # In eV
-        
+        if method_vib == 'EP':
+            state = np.array([1.0 for _ in range(num_modes)])
+            energy_list = kb * temp_vib * state     # In eV
+            state_str = ' states ' + ' '.join([str(i) for i in state]) + ' ;'
+
         ### Equipartition for TS ###
-        elif method == 'EP_TS':
+        elif method_vib == 'EP_TS':
             state = np.array([1.0 for _ in range(num_modes - 1)] + [0.5])
-            energyList = kb * temp * state     # In eV
-        
+            energy_list = kb * temp_vib * state     # In eV
+            state_str = ' states ' + ' '.join([str(i) for i in state]) + ' ;'
+
         ### Quasi-classical trajectory ###
-        elif method == 'QCT':
+        elif method_vib == 'QCT':
             if state == None:
-                state = self.genState(freq_list, num_modes, temp)
+                state = gen_state_from_Boltzmann(freq_list, num_modes, temp_vib)
             assert len(state) == num_modes
-            print('The state is ', state)
-            stateStr = [str(i) for i in state]
-            stateStr = ' states ' + ' '.join(stateStr)+' ;'
-            self.title += stateStr
-            energyList = np.array(freq_list) * (np.array(state) + 0.5)     # In eV
-        
-        ### Quasi-classical trajectory for TS ###
-        elif method == 'QCT_TS':
-            # vibrational modes
+            energy_list = np.array(freq_list) * (np.array(state) + 0.5)  # In eV
+            state_str = ' states ' + ' '.join([str(i) for i in state])+' ;'
+
+        ### QCT without ZPE ###
+        elif method_vib == 'QCT_noZPE':
             if state == None:
-                state = self.genState(freq_list[: -1], num_modes - 1, temp)
+                state = gen_state_from_Boltzmann(freq_list, num_modes, temp_vib)
+            assert len(state) == num_modes
+            energy_list = np.array(freq_list) * np.array(state)     # In eV
+            state_str = ' states ' + ' '.join([str(i) for i in state]) + ' ;'
+
+        ### Quasi-classical trajectory for TS ###
+        elif method_vib == 'QCT_TS':
+            # vibrational modes except the imaginary mode
+            if state == None:
+                state = gen_state_from_Boltzmann(freq_list[: -1], num_modes - 1, temp_vib)
             assert len(state) == num_modes - 1
-            print('The state is ', state)
-            stateStr = [str(i) for i in state]
-            stateStr = ' states ' + ' '.join(stateStr)
-            self.title += stateStr
-            energyList = np.array(freq_list[: -1]) * (np.array(state) + 0.5)
+            energy_list = np.array(freq_list[: -1]) * (np.array(state) + 0.5)  # In eV
             # reaction coordinates
-            energyReactionCoord = self.genClassicBoltzmann(temp)
-            energyList = energyList.tolist()
-            energyList.append(energyReactionCoord)
-            energyList = np.array(energyList)     # In eV
-            self.title += '  {:2.6f} eV;'.format(energyReactionCoord)            
+            energy_reaction_coordinate = gen_energy_from_Classical_Boltzmann(temp_vib)
+            energy_list = np.append(energy_list, energy_reaction_coordinate)  # In eV
+            state_str = ' states ' + ' '.join([str(i) for i in state]) + ' {:2.6f} eV;'.format(energy_reaction_coordinate)
         
         ### Classical Boltzmann (Exponetial) ###
-        elif method == 'CB':
-            energyList = [self.genClassicBoltzmann(temp) for i in range(num_modes)]     # In eV
-        
-        ### QCT without ZPE ###
-        elif method == 'QCT_noZPE':
-            energyList = np.array(freq_list) * np.array(state)     # In eV
+        elif method_vib == 'CB':
+            state = []
+            energy_list = np.array([gen_energy_from_Classical_Boltzmann(temp_vib) for _ in range(num_modes)])     # In eV
+            state_str = ' states ' + ' '.join([str(i) for i in state]) + ' ;'
         
         ### test ###
-        elif method == 'test':
-            print(kb, temp, state)
-            energyList = kb * temp * np.array(state)
+        elif method_vib == 'test':
+            if state == None:
+                state = np.array([1.0 for _ in range(num_modes)])
+            assert len(state) == num_modes
+            energy_list = kb * temp_vib * np.array(state)
+            state_str = ' states ' + ' '.join([str(i) for i in state]) + ' ;'
         
-        ### Error ###
+        ### error ###
         else:
-            raise Exception('Unidentified method')
-        
-        Ev = sum(energyList)
-        print('The vibrational energies are', energyList)
-        print('The total vibrational energy is', Ev)
-        self.title += ' Ev '+"{:10.5f}".format(Ev)+' eV;'
+            raise Exception('Error: invalid method for vibrational velocities.')
 
-            
-        # Generate coordNorm and vNorm
-        print('Random phase: ', randomPhase)
+        print('The state is ', state)
+        self.set_title(state_str)
+
+        # compute total vibrational energy
+        Ev = np.sum(energy_list)
+        print('The vibrational energies are', energy_list)
+        print('The total vibrational energy is', Ev)
+        self.set_title(' Ev '+"{:10.5f}".format(Ev)+' eV;')
+
+        # compute normal coordinates and normal velocities
+        print('Input phase: ', input_phase)
+        coordinates_Norm, velocities_Norm = Sampler.gen_normal_coordinates_velocities(energy_list, freq_list, input_phase, input_file_anharmonicity)
+        if method_vib == 'QCT_TS':
+            coordinates_Norm_TS, velocities_Norm_TS = Sampler.gen_normal_coordinates_velocities(energy_list[-1:], freq_list[-1:], input_phase=[1.5],
+                                                           input_file_anharmonicity=input_file_anharmonicity) # input_phase: 0.5 or 1.5 for TS
+            coordinates_Norm[-1] = coordinates_Norm_TS[0]
+            velocities_Norm[-1] = velocities_Norm_TS[0]
+        print('The velocity for each normal mode is', velocities_Norm)
+        print('The normal coordinate for each normal mode is', coordinates_Norm)
         
-        coordNorm, vNorm = self.genNormalCoordAndV(energyList, freq_list, randomPhase, anharmonicity)
-        
-        if method == 'QCT_TS':
-            coordNormTS, vNormTS = self.genNormalCoordAndV(energyList[-1:], freq_list[-1:], randomPhase=1.5, anharmonicity=False)
-            coordNorm[-1] = coordNormTS[0]
-            vNorm[-1] = vNormTS[0]
-        
-        print('The velocity for each normal mode is', vNorm)
-        print('The normal coordinate for each normal mode is', coordNorm)
-        
-        # Generate mass list
+        # get mass list
         mass = []
         for n, atom in enumerate(atom_types):
-            number = atom_counts[n]
-            massAtom = [self.masses[atom] for i in range(number * 3)]
+            count = atom_counts[n]
+            massAtom = [self.masses[atom] for _ in range(count * 3)]
             mass.extend(massAtom)
         assert len(mass) == num_atoms * 3
-#        print(mass)
         
-        # flat modes to modesMatrix
-        modesMatrix = []
+        # flat modes to modes_flat
+        modes_flat = []
         for mode in modes:
-            modeFlat = []
+            mode_flat = []
             for m in mode:
-                modeFlat.extend(m)
-            assert len(modeFlat) == 3 * num_atoms
-            modesMatrix.append(modeFlat)
-        assert len(modesMatrix) == num_modes
+                mode_flat.extend(m)
+            assert len(mode_flat) == 3 * num_atoms
+            modes_flat.append(mode_flat)
+        assert len(modes_flat) == num_modes
         
-        # Compute velocity
-        vMatrix = np.array(modesMatrix).transpose() * np.array(vNorm)
-        vMatrix = vMatrix.transpose()                 # velocities * mass**0.5 in angstrom/10 fs
-        vList = sum(vMatrix) / (np.array(mass)**0.5)  # velocities in angstrom/10 fs
-        vList = vList/10.0                            # velocities in angstrom/fs
-        vList = vList.tolist()
+        # compute velocities
+        velocities_matrix = (np.array(modes_flat).transpose() * np.array(velocities_Norm)).transpose() # velocities * mass**0.5 in angstrom/10 fs
+        velocities_flat = sum(velocities_matrix) / (np.array(mass)**0.5)  # velocities in angstrom/10 fs
+        velocities_flat = (velocities_flat/10.0).tolist()                 # velocities in angstrom/fs
         velocities_vib = []
         for n in range(num_atoms):
-            velocities_vib.append(vList[n * 3 : (n + 1) * 3])
-        
-        # Compute coordinates
-        disMatrix = np.array(modesMatrix).transpose() * np.array(coordNorm)
-        disMatrix = disMatrix.transpose()                  # dis * mass**0.5 in angstrom
-        disList = sum(disMatrix) / (np.array(mass)**0.5)   # dis in angstrom
-        disList = disList.tolist()
-        dis = []
-        for n in range(num_atoms):
-            dis.append(disList[n * 3 : (n + 1) * 3])
-            
-        new_coordinates = np.array(coordinates) + np.array(dis)
-        coordinates = new_coordinates.tolist().copy()
-        
+            velocities_vib.append(velocities_flat[n * 3 : (n + 1) * 3])
         assert len(velocities_vib) == num_atoms
-#        print('The vibrational velocity is', velocities_vib)
-#        print('The coordinates is', coordinates)
+        
+        # compute coordinates
+        displacement_matrix = (np.array(modes_flat).transpose() * np.array(coordinates_Norm)).transpose() # dis * mass**0.5 in angstrom
+        displacement_flat = sum(displacement_matrix) / (np.array(mass)**0.5)  # dis in angstrom
+        displacement_flat = displacement_flat.tolist()
+        displacement = []
+        for n in range(num_atoms):
+            displacement.append(displacement_flat[n * 3 : (n + 1) * 3])
+        coordinates = (np.array(coordinates) + np.array(displacement)).tolist()
+        assert len(coordinates) == num_atoms
         
         return atom_types, atom_counts, coordinates, flags, velocities_vib
         
     
-    def gen_velocities_trans(self, input_file, file_format, tempTrans, directTrans, lcell=False, methodTrans='EP'):
+    def gen_velocities_trans(self, input_file, file_format, lcell, method_trans, temp_trans, translation_vector):
         """
-        Generate translational velocity for a structure
-        :param input_file: str, the name of coordinates file, i.e. POSCAR
-        :param file_format: str, format of the input coordinates and velocities file. Allowed values include 'vasp' or 'ase'
-        :param tempTrans: float, temperature of translational energy
-        :param directTrans: list[float], vector indicate the direction of the translational velocity
-        :param lcell: boolean, whether overwrite cell
-        :param methodTrans: str, the name of method
-        :return: vTrans: list of float, translational velocities, [x, y, z]
+        Generate translational velocities for a structure
+        :param input_file: str, path of the coordinates input file, i.e. POSCAR
+        :param file_format: str, format of the coordinates and velocities input file. Allowed values include 'vasp' or 'ase'
+        :param lcell: boolean, whether to overwrite the cell or not
+        :param method_trans: str, method for generating translational velocities. 'EP' for 'Equipartition', 'MAXWELL' for 'Maxwell'.
+        :param temp_trans: float, temperature of translational energy
+        :param translation_vector: list of floats, vector that describes the direction of the translational velocity
+        :return: velocities_trans: list of lists, translational velocities, [[x1, y1, z1], [x2, y2, z2], ...]
         """
         # constant
         tutoev = 1.0364314        #change tu unit to eV
         kb = 8.61733035e-05       #Boltzmann constant in eV/K
         
-        # Read coordinates
-        cell, atom_types, atom_counts, coordinates, flags, _, _ = read_coordinates(input_file, file_format)
+        # read coordinates
+        cell, atom_types, atom_counts, coordinates, flags, _, _ = read_coordinates(input_file, file_format, lenergy=False)
         if lcell:
             self.set_cell(cell)
         
-        # Normalize direction vector
-        directTrans = directTrans / np.linalg.norm(directTrans)
+        # normalize translation vector
+        translation_vector_normed = translation_vector / np.linalg.norm(translation_vector)
         
-        # Compute mass of the molecule
-        totalMass = 0.0
+        # compute mass of the molecule
+        total_mass = 0.0
         for n, atom in enumerate(atom_types):
             number = atom_counts[n]
-            totalMass += self.masses[atom] * number
+            total_mass += self.masses[atom] * number
             
-        # Compute the velocity of the molecule
-        if methodTrans == 'EP':
-            rateTrans = (((3 * kb * tempTrans / tutoev) / totalMass)**0.5) / 10.0
-            
-        elif methodTrans == 'MAXWELL':
-            a = ((kb * tempTrans / tutoev) / totalMass)**0.5
+        # compute velocities of the molecule
+        if method_trans == 'EP':
+            rate_trans = (((3 * kb * temp_trans / tutoev) / total_mass)**0.5) / 10.0
+        elif method_trans == 'MAXWELL':
+            a = ((kb * temp_trans / tutoev) / total_mass)**0.5
             x = maxwell.rvs(size = 1)[0]
-            rateTrans = a * x / 10.0
+            rate_trans = a * x / 10.0
+        else:
+            raise Exception('Error: invalid method for translational velocities.')
+        velocities_trans = (np.array(translation_vector_normed) * rate_trans).tolist()
+        assert len(velocities_trans) == 3
+
+        # compute translational energy
+        Et = tutoev * total_mass * (10.0 * rate_trans) ** 2.0 / 2.0
+        Et_avg = 3.0 * kb * temp_trans / 2.0
+        print('The incident translational energy is {:4.4f} eV; the average is {:4.4f} eV.'.format(Et, Et_avg))
+        print('The translational rate is {:4.4f} angstrom/fs.'.format(rate_trans))
+        print(f'The translational velocity is {velocities_trans}.')
+        self.set_title(" Et   {:6.4f} eV;".format(Et))
         
-        # Check translational energy
-        Et = tutoev * totalMass * (10.0 * rateTrans)**2.0 / 2.0
-        EtAve = 3.0 * kb * tempTrans / 2.0
-        print('The incident translational energy is '+str(Et)+' eV; average is '+str(EtAve))
-        print('The translational velocity is '+str(rateTrans)+' angstrom/fs')
-        
-        # update title
-        EtStr = " Et   {:10.5f}".format(Et)+' eV;'
-        self.title += EtStr
-        
-        vTrans = np.array(directTrans) * rateTrans
-        vTrans = vTrans.tolist()
-        
-        assert len(vTrans) == 3  
-        print('The translational velocity is ', vTrans)
-        
-        return vTrans
+        return velocities_trans
 
 
-    def genQuantumNumber(self, freq, temp, probThreshold = 1.0e-6):
-        """ 
-        Generate quantum number from a boltzmann distribution for one mode
-        :param freq: float, frequency in eV
-        :param temp: float, temperature in K
-        :param probThreshold: float, if P(state) < probThreshold, ignore it
+    @staticmethod
+    def gen_normal_coordinates_velocities(energy_list, freq_list, input_phase='random', input_file_anharmonicity=None):
+        """
+        Given energy (in eV) and frequency (in eV) for each mode, compute normal coordinates and normal velocities.
+        :param energy_list: list of floats, energy (in eV) for each mode
+        :param freq_list: list of floats, frequency (in eV) for each mode
+        :param input_phase: str or list of floats; if it is a str, allowed values include 'random' and 'equilibrium';
+        if it is a list of floats, input phases are defined by input_phase * pi
+        :param input_file_anharmonicity: None or str, if it is None, do not consider anharmonicity;
+        if it is a str, it is the path of the anharmonicity input file
         :return:
-        quantum: int, quantum number
-        """
-        kb = 8.61733035e-05       #Boltzmann constant in eV/K
-        lambda_ = freq / (kb * temp)
-        
-        # Compute bound for Boltzmann distribution
-        N = math.ceil(-np.log(probThreshold)/lambda_)
-        N = min(N, 20)
-               
-        # Generate a quantum number
-        quantum = boltzmann.rvs(lambda_, N, size = 1)[0]
-        
-        return quantum
-    
-    
-    def genState(self, freq_list, num_modes, temp):
-        """
-        Generate a state for a molecule from Boltzmann distribution
-        :param freq_list: list of floats, list of frequencies
-        :param num_modes: int, number of modes
-        :param temp: float, temperature
-        :return:
-        state: list of ints, list of quantum numbers
-        """
-        assert len(freq_list) == num_modes
-        
-        state = []
-        for freq in freq_list:
-            quantum = self.genQuantumNumber(freq, temp)
-            state.append(quantum)
-            
-        assert len(state) == num_modes
-        
-        return state
-    
-    
-    def genClassicBoltzmann(self, temp):
-        """
-        Generate an energy from classical Boltzmann distribution
-        :param temp: float, temperature
-        :return:
-        energy: float, energy
-        """
-        kb = 8.61733035e-05       #Boltzmann constant in eV/K
-        
-        beta = kb * temp
-        energy = np.random.exponential(beta)
-        
-        return energy
-    
-    
-    def genNormalCoordAndV(self, energyList, freq_list, randomPhase = False, anharmonicity = None):
-        """
-        Input a list of energy (in eV) and a list of frequency (in eV),
-        Return normal coordinates and normal velocities based on phase
-        :param energyList: list of floats, list of energies
-        :param freq_list: list of floats, list of frequences
-        :param randomPhase: boolean or integer, if it is a boolean, perform random phase or not; if it is an integer, randomPhase * phi is the input phase
-        :param anharmonicity: None or string, do not consider anharmonicity if None; file name indicates whether or not consider anharmonicity
-        :return:
-        coordNorm: list of floats, normal coordinates
-        vNorm: list of floats, normal mode velocities
+        coordinates_normal: list of lists, normal coordinates, [[x1, y1, z1], [x2, y2, z2], ...]
+        velocities_normal: list of lists, normal velocities, [[x1, y1, z1], [x2, y2, z2], ...]
         """
         # constants
-        hbar = 0.06582119514      # eV * 10fs
-        tutoev = 1.0364314        #change tu unit to eV
-        
+        hbar = 0.06582119514  # eV * 10fs
+        tutoev = 1.0364314  # change tu unit to eV
+
         # check inputs
-        assert len(energyList) == len(freq_list)
         num_modes = len(freq_list)
-        
-        # Compute amplitude
-        energy = np.array(energyList) / tutoev    # energy unit: tu
-        freq = np.array(freq_list) / hbar          # Unit: (10fs)**(-1)
-        amplitude = np.sqrt(energy * 2.0) / freq  # list of amplitudes for all modes
-        
-        # Generate phase
-        if isinstance(randomPhase, bool):
-            if randomPhase:
+        assert len(energy_list) == num_modes
+
+        # compute amplitudes
+        energies_tu = np.array(energy_list) / tutoev  # energy unit: tu
+        freqs = np.array(freq_list) / hbar  # Unit: (10fs)**(-1)
+        amplitudes = np.sqrt(energies_tu * 2.0) / freqs  # list of amplitudes for all modes
+
+        # generate phase
+        if isinstance(input_phase, str):
+            if input_phase == 'random':
+                # randomly generate a phase
                 phase = np.random.uniform(0.0, 2.0 * np.pi, num_modes)
                 phase = np.array(phase)
-            else:
-                # start from equilibrium popsition
+            elif input_phase == 'equilibrium':
+                # start from equilibrium position
                 phase = np.random.randint(0, 2, num_modes)
                 phase = np.array(phase) * np.pi + 0.5 * np.pi
+            else:
+                raise Exception('Error: invalid input phase.')
+        elif isinstance(input_phase, list):
+            # generate phase according to input_phase
+            phase = np.array(input_phase) * np.pi
         else:
-            phase = np.array(randomPhase) * np.pi
-        
-        # Compute normal coordinates and normal velocities
+            raise Exception('Error: invalid input phase.')
+
+        # compute normal coordinates and normal velocities
         s, c = np.sin(phase), np.cos(phase)
-        coordNorm = amplitude * c            # A * cos(phi)
-        vNorm = -amplitude * freq * s        # -A * freq * sin(phi)
-        
+        coordinates_normal = amplitudes * c  # A * cos(phi)
+        velocities_normal = -amplitudes * freqs * s  # -A * freq * sin(phi)
+
         # correct for anharmonicity
-        if anharmonicity:
-            inFile = open(anharmonicity, 'r')
-            
-            inFile.readline()
-            
-            for mode in range(1, num_modes + 1):
-                line = inFile.readline().strip().split()
-                
-                if line[-1] == 'False':
-                    continue
-                
-                inFilePES = 'mode_' + str(mode)
-                coordNormMode = coordNorm[mode - 1]
-                freqMode = freq[mode - 1]
-                coordNorm[mode - 1] = self.anharmonicityCorrection(inFilePES, coordNormMode, freqMode)
-            
-            inFile.close()
-        
-        return coordNorm, vNorm
-    
-    
-    def anharmonicityCorrection(self, inFilePES, coordNorm, freq):
+        if input_file_anharmonicity is not None:
+            with open(input_file_anharmonicity, 'r') as data:
+                data.readline()
+                for mode in range(1, num_modes + 1):
+                    line = data.readline().strip().split()
+                    if line[-1] == 'False':
+                        continue
+                    input_file_PES = 'mode_' + str(mode)
+                    coord_normal_mode = coordinates_normal[mode - 1]
+                    freq_mode = freqs[mode - 1]
+                    coordinates_normal[mode - 1] = Sampler.anharmonicity_correction(input_file_PES, coord_normal_mode, freq_mode)
+
+        return coordinates_normal, velocities_normal
+
+
+    @staticmethod
+    def anharmonicity_correction(input_file_PES, coord_normal_mode, freq_mode):
         """
-        Correct normal coordinates, using real PES (including anharmonicity)
-        :param inFilePES: string, the file name of the real PES
-        :param coordNorm: float, the normal coordinate from harmonic oscillator model
-        :param freq: float, the frequency of the mode, Unit: (10fs)**(-1)
+        Correct normal coordinates, using real PES (containing anharmonicity)
+        :param input_file_PES: string, path of the real PES input file
+        :param coord_normal_mode: float, normal coordinate obtained from the harmonic oscillator model
+        :param freq_mode: float, frequency of the mode, unit: (10fs)**(-1)
         :return:
-        coordNormCorrected: float, the normal coordinate corrected by real PES
+        coord_normal_mode_AH: float, normal coordinate corrected by real PES
         """
         # constants
-        hbar = 0.06582119514      # eV * 10fs
-        tutoev = 1.0364314        #change tu unit to eV
-        
+        hbar = 0.06582119514  # eV * 10fs
+        tutoev = 1.0364314  # change tu unit to eV
+
         # read potential energy
-        pesSide1 = []
-        pesSide2 = []
+        PES_negative = []
+        PES_positive = []
         q1 = []
         q2 = []
-        
-        inFile = open(inFilePES, 'r')
-        
-        # read side1
-        inFile.readline()
-        
-        line = inFile.readline()
-        while 'side2' not in line:
-            data = line.strip().split()
-            pesSide1.append(float(data[0]))
-            q1.append(float(data[1]))
-            line = inFile.readline()
-        
-        # read side2
-        line = inFile.readline()
-        while line:
-            data = line.strip().split()
-            pesSide2.append(float(data[0]))
-            q2.append(float(data[1]))
-            line = inFile.readline()
-        
-        #print(pesSide1, q1, pesSide2, q2)
-        
-        inFile.close()
-        
+
+        with open(input_file_PES, 'r') as data:
+            # read negative side
+            data.readline()
+            line = data.readline()
+            while 'side2' not in line:
+                line = line.strip().split()
+                PES_negative.append(float(line[0]))
+                q1.append(float(line[1]))
+                line = data.readline()
+            # read positive side
+            line = data.readline()
+            while line:
+                line = line.strip().split()
+                PES_positive.append(float(line[0]))
+                q2.append(float(line[1]))
+                line = data.readline()
+
         # fit the real PES from input data
-        if coordNorm <= 0:
-            pes = interpolate.interp1d(pesSide1, q1)
+        if coord_normal_mode <= 0:
+            PES = interpolate.interp1d(PES_negative, q1)
         else:
-            pes = interpolate.interp1d(pesSide2, q2)
-        
-        # compute potential energy from input coordNorm
-        V = 0.5 * (freq * coordNorm)**2.0 * tutoev    # in eV
-        
+            PES = interpolate.interp1d(PES_positive, q2)
+
+        # compute potential energy from input coord_normal_mode
+        V = 0.5 * (freq_mode * coord_normal_mode) ** 2.0 * tutoev  # in eV
+
         # compute the real normal coordinate by interpolation
-        coordNormAHO = pes(V)
-        
-        print(inFilePES, 'frequency', freq * hbar, ', difference in normal coordinates:', coordNormAHO - coordNorm)
-        
-        return coordNormAHO
+        coord_normal_mode_AH = PES(V)
+        print(input_file_PES, 'frequency', freq_mode * hbar, ', difference in normal coordinates:',
+              coord_normal_mode_AH - coord_normal_mode)
 
+        return coord_normal_mode_AH
 
-    def PES(self, in_file_coordinates, in_file_eigen, num_modes, num_atoms, mode, sign, out_file_name):
-        """
-        Generate POSCAR file for computing PES along one mode using AIMD
-        """
-        cell, atom_types, atom_counts, coordinates, flags, velocities_old, _ = read_coordinates(in_file_coordinates, 'vasp')
-        self.set_cell(cell)
-        num_atoms = sum(atom_counts)
-        num = len(atom_types)
-        freq_list, modes = read_normal_modes(in_file_eigen, num_modes, num_atoms)
-        assert len(freq_list) == num_modes
-        assert len(modes) == num_modes
-        assert len(modes[0]) == num_atoms
-
-        # Generate mass list
-        mass = []
-        for n in range(num):
-            atom = atom_types[n]
-            number = atom_counts[n]
-            mass_atom = [self.masses[atom] for i in range(number)]
-            mass.extend(mass_atom)
-        assert len(mass) == num_atoms
-        
-        # Generate velocity
-        eigen = np.array(modes[mode-1])
-        velocities = eigen.transpose()/(np.array(mass)**0.5)
-        velocities = velocities.transpose()*sign
-        
-        self.set_state(atom_types, atom_counts, coordinates, flags, velocities)
-        self.output(out_file_name)        
-        
-
-    def shift(self, in_file_name, atom_num, in_file_name_ref, atom_num_ref):
-        """
-        Shift the geometry in periodic system
-        """
-        _, atom_types_ref, atom_counts_ref, coordinates_ref, flags_ref, velocities_ref, _ = read_coordinates(in_file_name_ref, 'vasp')
-        cell, atom_types, atom_counts, coordinates, flags, velocities, _ = read_coordinates(in_file_name, 'vasp')
-        self.set_cell(cell)
-        direction = np.array(coordinates_ref[atom_num_ref-1])-np.array(coordinates[atom_num-1])
-        pos = np.array(coordinates)
-
-        pos_new = pos+direction
-        pos_new = pos_new.tolist()
-        for atom in pos_new:
-            if atom[0]<0:
-                atom[0]=atom[0]+self.cell[0][0]
-            if atom[0]>self.cell[0][0]:
-                atom[0]=atom[0]-self.cell[0][0]
-            if atom[1]<0:
-                atom[1]=atom[1]+self.cell[1][1]
-            if atom[1]>self.cell[1][1]:
-                atom[1]=atom[1]-self.cell[1][1]
-        self.set_state(atom_types, atom_counts, pos_new, flags, velocities)
-        out_file_name = in_file_name+'shifted'
-        self.output(out_file_name)
-
-    
-    def add_perp(self, in_file_name, Cu1_number, Cu2_number, c_number, O2_length, O2_dist):
-        """
-        Add O2 perpendicular to a given Cu-Cu bond
-        :param Cu1_number: int, representing the coordinates of Cu1
-        :param Cu2_number: int, representing the coordinates of Cu2
-        :param c_number: list of 3 float or int, representing the coordinates of a reference atom to define the direction that O2 comes in, if c_number is a list then use that as the coordinates
-        :param O2_length: float, representing O2 bondlength
-        :param O2_dist: float, representing the distance from Cu-Cu center to O2
-        """
-        cell, atom_types, atom_counts, coordinates, flags, velocities, _ = read_coordinates(in_file_name, 'vasp')
-        self.set_cell(cell)
-        self.set_state(atom_types, atom_counts, coordinates, flags, velocities)
-        
-        Cu1 = self.get_atom_coordinates(coordinates, Cu1_number)
-        Cu2 = self.get_atom_coordinates(coordinates, Cu2_number)
-        if isinstance(c_number, int):
-            c = self.get_atom_coordinates(coordinates, c_number)
-        elif isinstance(c_number, list):
-            c = c_number.copy()
-        Cu1 = np.array(Cu1)
-        Cu2 = np.array(Cu2)
-        c = np.array(c)
-        
-        Cu_center = (Cu1+Cu2)/2.0
-        d1 = Cu1-c
-        d2 = Cu2-c
-        shift = np.cross(d1, d2)
-        shift = shift/np.linalg.norm(shift)
-        if np.dot(shift, np.array([0.0, 0.0, 1.0])) < 0:
-            shift = -1.0*shift
-    
-        O2_center = Cu_center+shift*O2_dist
-        e1 = Cu1-O2_center
-        e2 = Cu2-O2_center
-        direction = np.cross(e1, e2)
-        direction = direction/np.linalg.norm(direction)
-        O1 = O2_center+direction*O2_length*0.5
-        O2 = O2_center-direction*O2_length*0.5
-        O1 = O1.tolist()
-        O2 = O2.tolist()
-        
-        O2_types = ['O']
-        O2_numbers = [2]
-        O2_coordinates = [O1, O2]
-        O2_flags = ['   F   F   F', '   F   F   F']
-        O2_velocities = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
-        self.set_state(O2_types, O2_numbers, O2_coordinates, O2_flags, O2_velocities)
-        self.output(in_file_name+'_O2')
-        print('Adding O2 done')
-
-
-    def add_toTop(self, in_file_name, Cu_number, O1_number, O2_number, O2_length, O2_dist):
-        """
-        Add O2 to the top of a given Cu-Cu bond
-        :param Cu_number: int, representing the coordinates of Cu1
-        :param c_number: list of 3 float or int, representing the coordinates of a reference atom to define the direction that O2 comes in, if c_number is a list then use that as the coordinates
-        :param O2_length: float, representing O2 bondlength
-        :param O2_dist: float, representing the distance from Cu-Cu center to O2
-        """
-        cell, atom_types, atom_counts, coordinates, flags, velocities, _ = read_coordinates(in_file_name, 'vasp')
-        self.set_cell(cell)
-        self.set_state(atom_types, atom_counts, coordinates, flags, velocities)
-        
-        Cu = np.array(self.get_atom_coordinates(coordinates, Cu_number))
-        O1 = np.array(self.get_atom_coordinates(coordinates, O1_number))
-        O2 = np.array(self.get_atom_coordinates(coordinates, O2_number))
-        direction = (O2+O1)/2.0-Cu
-        direction = direction/np.linalg.norm(direction)
-        O2Direction = O2-O1
-        O2Direction = O2Direction/np.linalg.norm(O2Direction)
-        
-        center = Cu+direction*O2_dist
-        O2New = center+O2Direction*O2_length/2.0
-        O1New = center-O2Direction*O2_length/2.0
-        O2New = O2New.tolist()
-        O1New = O1New.tolist()
-        
-        coordinates[O2_number-1] = O2New
-        coordinates[O1_number-1] = O1New
-        print(O1New, O2New)
-        self.coordinates = coordinates.copy()
-        self.output(in_file_name+'_modified')
-        print('Adding O2 done')
-    
     
     def output(self, output_file):
         """
         Write the output file for the system
+        :param output_file: str, path of the output file, i.e. POSCAR
         """
-        if len(self.cell) == 0:
-            raise Exception('Unit cell not set')
-        cell = self.cell.copy()
-        atom_types = self.atom_types.copy()
-        atom_counts = self.atom_counts.copy()
-        coordinates = self.coordinates.copy()
-        flags = self.flags.copy()
-        velocities = self.velocities.copy()
+        cell = self.get_cell()
+        if len(cell) == 0:
+            raise Exception('Error: undefined unit cell.')
+        atom_types, atom_counts, coordinates, flags, velocities = self.get_state()
+        assert len(atom_types) == len(atom_counts)
         num_atoms = sum(atom_counts)
         assert len(coordinates) == num_atoms
         assert len(flags) == num_atoms
         assert len(velocities) == num_atoms
+        title = self.get_title()
         
-        # Write POSCAR file
+        # write POSCAR file
         with open(output_file, 'w') as out:
-            out.write(self.title+'\n')
+            # title
+            out.write(title + '\n')
             out.write('   1.000'+'\n')
-            
+            # cell
             cell_str = ''
             for i in range(3):
                 for j in range(3):
                     cell_str += '   '+"{:10.8f}".format(float(cell[i][j]))
                 cell_str += '\n'
             out.write(cell_str)
-            
-            atoms_type_str = '   '+'   '.join(atom_types)+'\n'
-            out.write(atoms_type_str)
+            # atom types and atom numbers
+            atom_types_str = '   ' + '   '.join(atom_types) + '\n'
+            out.write(atom_types_str)
             atom_counts = [str(n) for n in atom_counts]
-            atoms_num_str = '   '+'   '.join(atom_counts)+'\n'
-            out.write(atoms_num_str)
-            out.write('Selective dynamics'+'\n'+'Cartesian'+'\n')
-            
+            atom_counts_str = '   ' + '   '.join(atom_counts) + '\n'
+            out.write(atom_counts_str)
+            out.write('Selective dynamics\nCartesian\n')
+            # coordinates
             coordinates_str = ''
             for i in range(num_atoms):
                 for j in range(3):
-                    coordinates_str += '   '+"{:10.8f}".format(coordinates[i][j])
-                coordinates_str += flags[i]+'\n'
+                    coordinates_str += '   {:10.8f}'.format(coordinates[i][j])
+                coordinates_str += flags[i] + '\n'
             out.write(coordinates_str)
-            
+            # velocities
             out.write('Cartesian'+'\n')
             velocities_str = ''
             for i in range(num_atoms):
                 for j in range(3):
-                    velocities_str += '   '+"{:10.8f}".format(velocities[i][j])
+                    velocities_str += '   {:10.8f}'.format(velocities[i][j])
                 velocities_str += '\n'
             out.write(velocities_str)
 
 
 ### Main functions ###
-    def state_sampling(self, input_file_coordinates, input_file_mode, num_modes, lrotation, method, T, state=None, output_file=None):
+    def sample_state_from_distribution(self, input_file_coordinates, input_file_modes, num_modes, lrotation,
+                                       method_vib, temp_vib, state=None, output_file=None):
         """
         Generate a state including coordinates and velocities, i.e. POSCAR file, for AIMD simulation MD
-        :param input_file_coordinates: str, file path of the local minimum structure (POSCAR file)
-        :param lrotation: boolean, whether rotate molecule or not
-        :param method: str, method for generating vibrational velocity. 'EP' for 'Equipartition', 'EP_TS' for 'Equipartition for TS',
+        :param input_file_coordinates: str, path of the local minimum structure input file, i.e. POSCAR
+        :param input_file_modes: str, path of the normal modes input file
+        :param num_modes: int, number of normal modes need to input
+        :param lrotation: boolean, whether to rotate molecule or not
+        :param method_vib: str, method for generating vibrational velocities. 'EP' for 'Equipartition', 'EP_TS' for 'Equipartition for TS',
         'QCT' for 'Quasi-classical trajectory', 'QCT_TS' for 'Quasi-classical trajectory for TS', 'CB' for 'Classical Boltzmann (Exponetial)',
         'QCT_noZPE' for 'QCT without ZPE'.
+        :param temp_vib: float, temperature of vibrational energy
         :param state: list of ints, quantum states
+        :param output_file: str, path of the output file, i.e. POSCAR
         """
-        # Read coordinates and modes files, generate velocities
-        atom_types, atom_counts, coordinates, flags, velocities_vib = self.gen_velocities_vib(input_file_coordinates, 'vasp', input_file_mode, num_modes,
-                                                                                               lcell=True, lrotation=lrotation, method=method, temp=T, state=state)
-        # Update data attributes
+        # read coordinates and modes files, generate velocities
+        atom_types, atom_counts, coordinates, flags, velocities_vib = self.gen_velocities_vib(input_file_coordinates, 'vasp', input_file_modes, num_modes,
+                                                                                              lcell=True, lrotation=lrotation, method_vib=method_vib, temp_vib=temp_vib, state=state)
+        # update data attributes
         self.set_state(atom_types, atom_counts, coordinates, flags, velocities_vib)
-        # Output initial state, i.e. POSCAR, for MD
+        # output initial state, i.e. POSCAR, for MD
         if output_file is None:
-            output_file = os.path.join(os.getcwd(), 'state_sampling.POSCAR')
+            output_file = os.path.join(os.getcwd(), 'state_sampling_from_distribution.POSCAR')
         self.output(output_file)
 
 
-    def state_sampling_from_trajectory(self, input_file_coordinates, input_file_traj_coord, input_file_velocities, input_file_energy,
-                                       trajectory_range, output_file=None):
+    def sample_state_from_trajectory(self, input_file_coordinates, input_file_traj_coord, input_file_velocities, input_file_energy,
+                                     trajectory_range, output_file=None):
         """
         Read coordinates and velocities of the trajectory, generate a POSCAR file for given snapshot
-        :param input_file_coordinates: str, file path of the local minimum structure (POSCAR file)
-        :param trajectory_range: list of two ints, the range within which to sample a state
+        :param input_file_coordinates: str, path of the local minimum structure input file, i.e. POSCAR
+        :param input_file_traj_coord: str, path of the trajectory coordinates input file, i.e. .coor file
+        :param input_file_velocities: str, path of the trajectory velocities input file, i.e. .velocity file
+        :param input_file_energy: str, path of the trajectory energy input file, i.e. .energy file
+        :param trajectory_range: list of two ints, range within which to sample a state
+        :param output_file: str, path of the output file, i.e. POSCAR
         """
-        # Get atom_types, atom_counts and flags from the local minimum structure
+        # get atom_types, atom_counts and flags from the local minimum structure
         _, atom_types, atom_counts, _, flags, _, _ = read_coordinates(input_file_coordinates, 'vasp')
         num_atoms = sum(atom_counts)
-        # Randomly generate a snapshot index
+        # randomly generate a snapshot index
         snapshot_idx = np.random.randint(trajectory_range[0], trajectory_range[1])
-        # Get cell, coordinates, velocities and energy from the trajectory
+        # get cell, coordinates, velocities and energy from the trajectory
         cell, _, _, coordinates, _ = read_coordinates_from_trajectory(input_file_traj_coord, snapshot_idx)
         velocities = read_velocities_from_trajectory(input_file_velocities, num_atoms, snapshot_idx)
         energy_str = read_energy_from_trajectory(input_file_energy, snapshot_idx)
-        # Update the state
+        # update the state
         self.set_cell(cell)
         self.set_state(atom_types, atom_counts, coordinates, flags, velocities)
         self.set_title(energy_str)
-        # Output initial state, i.e. POSCAR, for MD
+        # output initial state, i.e. POSCAR, for MD
         if output_file is None:
-            output_file = os.path.join(os.getcwd(), 'state_sampling.POSCAR')
+            output_file = os.path.join(os.getcwd(), 'state_sampling_from_trajectory.POSCAR')
         self.output(output_file)
 
 
-    def MD_initialization(self, cluster_infile_coordinates, molecule_infile_coordinates, impact_method, impact_site,
-                          distance_to_cluster, trans_T, method_trans='EP', output_file=None):
+    def MD_initialization(self, cluster_input_file_coord, molecule_input_file_coord, impact_method, impact_site,
+                          distance_to_cluster, method_trans, temp_trans, output_file=None):
         """
-
-        :param cluster_infile_coordinates: str,
-        :param molecule_infile_coordinates: str,
+        Initialize the system, including cluster/surface and impact molecule, generate the input file, i.e. POSCAR, for AIMD simulation
+        :param cluster_input_file_coord: str, path of the cluster coordinates input file, i.e. POSCAR
+        :param molecule_input_file_coord: str, path of the molecular coordinates input file, i.e. POSCAR
         :param impact_method: str, impact method. Allowed values include 'cluster_center', 'vertical_targeted' and 'vertical_nontargeted'
-        :param impact_site: molecule impact site
+        :param impact_site: int, molecule impact site
+        :param distance_to_cluster: float, distance between the molecule's COM and the impact site
+        :param method_trans: str, method for generating translational velocities. 'EP' for 'Equipartition', 'MAXWELL' for 'Maxwell'.
+        :param temp_trans: float, temperature of translational energy
+        :param output_file: str, path of the output file, i.e. POSCAR
         """
         ## Cluster/surface initialization
-        cell, cluster_atom_types, cluster_atom_counts, cluster_coordinates, cluster_flags, cluster_velocities, _ = read_coordinates(cluster_infile_coordinates,'vasp')
+        cell, cluster_atom_types, cluster_atom_counts, cluster_coordinates, cluster_flags, cluster_velocities, _ = read_coordinates(cluster_input_file_coord,'vasp')
         self.set_cell(cell)
         self.set_state(cluster_atom_types, cluster_atom_counts, cluster_coordinates, cluster_flags, cluster_velocities)
 
         ## Molecule initialization
-        _, molecule_atom_types, molecule_atom_counts, _, molecule_flags, molecule_velocities_vib, _ = read_coordinates(molecule_infile_coordinates, 'vasp')
-        # Calculate impact site coordinates and reference site coordinates
+        _, molecule_atom_types, molecule_atom_counts, _, molecule_flags, molecule_velocities_vib, _ = read_coordinates(molecule_input_file_coord, 'vasp')
+        # calculate impact site coordinates and reference site coordinates
         if impact_method == 'cluster_center': # molecule collides with the impact site in the direction towards the center of mass of the cluster
             coordinates_impact_site = self.get_atom_coordinates(cluster_coordinates, impact_site)   # impact site coordinates
             coordinates_ref_atom = get_COM(cluster_atom_types, cluster_atom_counts, cluster_coordinates)   # cluster center of mass coordinates
@@ -823,15 +630,16 @@ class Sampler():
         else:
             print('Error: invalid impact method.')
             return
-        molecule_coordinates, direct_trans = Sampler.gen_coordinates(molecule_infile_coordinates, 'vasp', coordinates_impact_site, coordinates_ref_atom, distance_to_cluster)
+        molecule_coordinates, translation_vector = Sampler.gen_coordinates(molecule_input_file_coord, 'vasp', coordinates_impact_site, coordinates_ref_atom, distance_to_cluster)
 
-        # Molecule initial velocity
-        molecule_velocities_trans = self.gen_velocities_trans(molecule_infile_coordinates, 'vasp', trans_T, direct_trans, False, method_trans)
+        # molecule initial velocity
+        molecule_velocities_trans = self.gen_velocities_trans(molecule_input_file_coord, 'vasp', lcell=False,
+                                                              method_trans=method_trans, temp_trans=temp_trans, translation_vector=translation_vector)
         molecule_velocities = (np.array(molecule_velocities_vib) + np.array(molecule_velocities_trans)).tolist()
-        # Update data attribute for molecule
+        # update data attribute for molecule
         self.set_state(molecule_atom_types, molecule_atom_counts, molecule_coordinates, molecule_flags, molecule_velocities)
 
-        # Output initial state, i.e. POSCAR, for MD
+        # output initial state, i.e. POSCAR, for MD
         if output_file is None:
             output_file = os.path.join(os.getcwd(), 'MD_molecule_cluster.POSCAR')
         self.output(output_file)

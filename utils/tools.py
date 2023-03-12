@@ -6,7 +6,13 @@ Created on Thu Feb 23 22:14:00 2023
 @author: Aqiph
 """
 
+
 import numpy as np
+import math
+from scipy.stats import boltzmann
+
+from utils.read_file import read_coordinates
+
 
 
 # Calculate the center of mass #
@@ -74,8 +80,44 @@ def translate(coordinates_before, translation_vector):
     return coordinates_after.tolist()
 
 
+def translate_in_PBC(input_file, translation_vector):
+    """
+    Translate the molecule in the periodic system
+    :param input_file: str, path of the coordinates input file, i.e. POSCAR
+    :param translation_vector: lists of floats or str, translation vector
+    :return:
+    cell: list of lists, cell, [[x1, y1, z1], [x2, y2, z2], ...]
+    atom_types: list of strs, element types
+    atom_counts: list of ints, number of atoms for each element type
+    coordinates_after: list of lists, [[x1, y1, z1], [x2, y2, z2], ...]
+    flags: list of strs, flags
+    velocities: list of lists, velocities, [[x1, y1, z1], [x2, y2, z2], ...]
+    energy: float, energy
+    """
+    # read coordinates
+    cell, atom_types, atom_counts, coordinates_before, flags, velocities, energy = read_coordinates(input_file, 'vasp')
+
+    # translated coordinates
+    coordinates_after = np.array(coordinates_before) + np.array(translation_vector)
+    for atom in coordinates_after:
+        if atom[0] < 0:
+            atom[0] = atom[0] + cell[0][0]
+        elif atom[0] > cell[0][0]:
+            atom[0]=atom[0] - cell[0][0]
+        if atom[1] < 0:
+            atom[1] = atom[1] + cell[1][1]
+        elif atom[1] > cell[1][1]:
+            atom[1] = atom[1] - cell[1][1]
+        if atom[2] < 0:
+            atom[2] = atom[2] + cell[2][2]
+        elif atom[2] > cell[2][2]:
+            atom[2] = atom[2] - cell[2][2]
+
+    return cell, atom_types, atom_counts, coordinates_after, flags, velocities, energy
+
+
 # Rotate a molecule and its normal modes #
-def rotate(atom_types, atom_counts, coordinates_before, modes_before=None):
+def rotate(atom_types, atom_counts, coordinates_before, modes_before=None, lprint=False):
     """
     Randomly rotate the molecule and its normal modes
     :param atom_types: list of strs, element types
@@ -153,7 +195,7 @@ def rotate(atom_types, atom_counts, coordinates_before, modes_before=None):
     coordinates_after = coordinates_after.tolist()
 
     # write new modes
-    if False:
+    if lprint:
         num_modes = len(modes_before)
         with open('new_modes', 'w') as output:
             for n in range(num_modes):
@@ -172,3 +214,68 @@ def rotate(atom_types, atom_counts, coordinates_before, modes_before=None):
                 output.write('\n')
 
     return coordinates_after, modes_after
+
+
+# Generate quantum number from a Boltzmann distribution and molecular state
+def gen_quantum_number(freq, temp, prob_threshold=1.0e-6):
+    """
+    Generate a quantum number from a Boltzmann distribution for one mode
+    :param freq: float, frequency in eV
+    :param temp: float, temperature in K
+    :param prob_threshold: float, if P(state) < prob_threshold, ignore it
+    :return:
+    quantum: int, quantum number
+    """
+    # constant
+    kb = 8.61733035e-05  # Boltzmann constant in eV/K
+    lambda_ = freq / (kb * temp)
+
+    # compute bound for Boltzmann distribution
+    N = math.ceil(-np.log(prob_threshold) / lambda_)
+    N = min(N, 20)
+
+    # generate a quantum number
+    quantum = boltzmann.rvs(lambda_, N, size=1)[0]
+
+    return quantum
+
+
+def gen_state_from_Boltzmann(freq_list, num_modes, temp):
+    """
+    Generate a quantum state for a molecule from Boltzmann distribution
+    :param freq_list: list of floats, frequency (in eV) for each mode
+    :param num_modes: int, number of normal modes
+    :param temp: float, temperature in K
+    :return:
+    state: list of ints, list of quantum numbers
+    """
+    assert len(freq_list) == num_modes
+
+    state = []
+    for freq in freq_list:
+        quantum = gen_quantum_number(freq, temp)
+        state.append(quantum)
+
+    assert len(state) == num_modes
+
+    return state
+
+
+# Generate energy from classical Boltzmann distribution
+def gen_energy_from_Classical_Boltzmann(temp):
+    """
+    Generate an energy from classical Boltzmann distribution
+    :param temp: float, temperature in K
+    :return:
+    energy: float, energy
+    """
+    # constant
+    kb = 8.61733035e-05  # Boltzmann constant in eV/K
+
+    # energy from Boltzmann distribution
+    beta = kb * temp
+    energy = np.random.exponential(beta)
+
+    return energy
+
+

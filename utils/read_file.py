@@ -15,8 +15,8 @@ import linecache
 def read_coordinates(input_file, file_format, lenergy=False):
     """
     Read coordinats and velocities from an existing file, e.g. POSCAR file
-    :param input_file: str, path of the input file, i.e. POSCAR
-    :param file_format: str, format of the input coordinates and velocities file. Allowed values include 'vasp' or 'ase'
+    :param input_file: str, path of the coordinates input file, i.e. POSCAR
+    :param file_format: str, format of the coordinates and velocities input file. Allowed values include 'vasp' or 'ase'
     :param lenergy: boolean, whether read energy or not
     :return:
     cell: list of lists, cell, [[x1, y1, z1], [x2, y2, z2], ...]
@@ -110,7 +110,7 @@ def read_coordinates(input_file, file_format, lenergy=False):
 def read_normal_modes(input_file, num_modes, num_atoms):
     """
     Read frequencies and normal modes from an existing file
-    :param input_file: str, path of the input file
+    :param input_file: str, path of the normal modes input file
     :param num_modes: int, number of normal modes need to input
     :param num_atoms: int, number of atoms
     :return:
@@ -157,7 +157,7 @@ def read_normal_modes(input_file, num_modes, num_atoms):
 def read_coordinates_from_trajectory(input_file, snapshot_idx):
     """
     Read coordinates from an existing .coord file (trajectory coordinates file)
-    :param input_file: str, path of the input coordinates file, i.e. .coor file
+    :param input_file: str, path of the trajectory coordinates input file, i.e. .coor file
     :param snapshot_idx: int, snapshot index, start from 1
     :return:
     cell: list of lists, cell, [[x1, y1, z1], [x2, y2, z2], ...]
@@ -213,7 +213,7 @@ def read_coordinates_from_trajectory(input_file, snapshot_idx):
 def read_velocities_from_trajectory(input_file, num_atoms, snapshot_idx):
     """
     Read velocities from an existing .velocity file (trajectory velocities file)
-    :param input_file: str, path of the input velocities file, i.e. .velocity file
+    :param input_file: str, path of the trajectory velocities input file, i.e. .velocity file
     :param num_atoms: int, number of atoms
     :param snapshot_idx: int, snapshot index, start from 1
     :return:
@@ -244,7 +244,7 @@ def read_velocities_from_trajectory(input_file, num_atoms, snapshot_idx):
 def read_energy_from_trajectory(input_file, snapshot_idx):
     """
     Read energy from an existing .energy file (trajectory energy file)
-    :param input_file: str, path of the input energy file, i.e. .energy file
+    :param input_file: str, path of the trajectory energy input file, i.e. .energy file
     :param snapshot_idx: int, snapshot index, start from 1
     :return:
     energy: str, energy string
